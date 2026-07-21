@@ -7,7 +7,7 @@ const vm = require('vm');
 
 const ctx = { console, Math, JSON };
 vm.createContext(ctx);
-for (const f of ['data.js', 'player.js', 'team.js', 'match.js', 'league.js']) {
+for (const f of ['data.js', 'player.js', 'team.js', 'field.js', 'formation.js', 'battle.js', 'league.js']) {
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'js', f), 'utf8'), ctx, { filename: f });
 }
 
@@ -90,12 +90,48 @@ vm.runInContext(`
   };
 `, ctx, { filename: 'harness' });
 
+// The spatial engine is heavier than the old abstract one, so run a few full
+// two-season careers per league rather than dozens.
 for (const leagueKey of ['NONBSP', 'BSP']) {
-  for (let i = 0; i < 15; i++) {
+  for (let i = 0; i < 3; i++) {
     const out = ctx.run(assert, leagueKey);
-    if (i === 0) console.log(`${leagueKey}: ok (avg ${out.avgLog} log events per match)`);
+    if (i === 0) console.log(`${leagueKey}: full two-season career ok (avg ${out.avgLog} log events per match)`);
   }
 }
+
+// Spatial-engine specifics: units get real positions, terrain, and plans.
+vm.runInContext(`
+  globalThis.runBattleChecks = function(assert) {
+    const map = genMap();
+    const field = genField(map);
+    assert(field.w === FIELD_W && field.h === FIELD_H, 'field dimensions');
+    const a = genTeam('A', 12, true), b = genTeam('B', 12, false);
+    // player provides an explicit plan; AI auto-plans
+    const plan = fitPlanToField(buildPlan('wedge'), field, 0);
+    const battle = createBattle(a, b, LEAGUE_TYPES.BSP, map, [plan, null]);
+    let placedInField = 0, total = 0;
+    for (const s of battle.sides) for (const u of s.units) {
+      total++;
+      if (u.x >= 0 && u.x <= FIELD_W && u.y >= 0 && u.y <= FIELD_H) placedInField++;
+      assert(u.hp === 100 && u.state === 'active', 'unit starts fit');
+    }
+    assert(placedInField === total, 'all units placed inside the field');
+    assert(total === battle.sides[0].fielded.length + battle.sides[1].fielded.length, 'unit count matches fielded');
+    // step it and confirm units actually move and the sim terminates
+    const start = battle.sides[0].units.filter(u=>u.role==='CM').map(u=>({x:u.x,y:u.y}));
+    let steps = 0;
+    while (!battle.over && steps++ < 1400) battle.step(0.3);
+    assert(battle.over, 'battle terminates');
+    assert(battle.result, 'battle produces a result');
+    const moved = battle.sides[0].units.filter(u=>u.role==='CM').some((u,i)=> Math.hypot(u.x-start[i].x,u.y-start[i].y) > 5);
+    assert(moved, 'units move during the battle');
+    const terr = battle.terrPct();
+    assert(terr[0] >= 0 && terr[1] >= 0 && terr[0] + terr[1] <= 100.5, 'territory percentage sane');
+    for (const e of battle.result.log) assert(!e.text.includes('undefined'), 'no undefined in battle log');
+  };
+`, ctx, { filename: 'battleharness' });
+for (let i = 0; i < 20; i++) ctx.runBattleChecks(assert);
+console.log('battle-engine checks ok');
 
 if (failures) { console.error(failures + ' assertion failure(s)'); process.exit(1); }
 console.log('All sim smoke tests passed.');

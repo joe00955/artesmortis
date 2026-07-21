@@ -3,7 +3,6 @@
 
 let SCREEN = 'home';
 let SQUAD_TAB = 'roster';
-let MATCH_PLAYBACK = null; // { result, idx, timer, speed, done }
 
 const $app = () => document.getElementById('app');
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
@@ -107,6 +106,7 @@ function renderHome() {
             <p style="margin-top:8px"><b>${esc(fx.map.name)}</b> — <span class="dim">${esc(fx.map.desc)}</span></p>
             <p class="small dim">Terrain effects: ${terrainEffects(fx.map)}</p>` : '<p>No fixture.</p>'}
           ${shortfalls.length ? `<p class="danger" style="margin-top:10px">⚠ UNDERSTRENGTH: missing ${shortfalls.map(s => `${s.missing} ${ROLES[s.role].name}`).join(', ')}. Sign free agents or you fight short-handed.</p>` : '<p class="good" style="margin-top:10px">✓ Full 15-strong squad available.</p>'}
+          <p class="small dim" style="margin-top:8px">Playing the matchday opens the planning board: set your formation and routes, then command the live battle in real time.</p>
         </div>
         <div class="panel">
           <h2>Standing</h2>
@@ -231,6 +231,9 @@ function renderTactics() {
       <div class="t">${title}</div><div class="d">${desc}</div>
     </div>`;
   return `
+    <div class="panel">
+      <p class="small dim">These doctrines set your squad's default behaviour and seed the formation you'll fine-tune on the pre-match planning board. On matchday you place your groups, draw advance routes, and can pause the live battle to issue new orders.</p>
+    </div>
     <div class="panel">
       <h2>Aggression</h2>
       <div class="optgrid">
@@ -386,7 +389,9 @@ function renderRules() {
           <li><b>Territory</b> — control more than 80% of the field.</li>
         </ul>
         <h2 style="margin-top:16px">The Flag</h2>
-        <p style="white-space:normal">Claimed land follows the Controller in a 500m radius as they move. The Controller can never be killed — only captured. A captured flag transfers <b>all</b> claimed territory to the captors at a stroke.</p>
+        <p style="white-space:normal">Claimed land follows the Controller in a 500m radius as they move. The Controller can never be killed — only captured. A captured flag transfers <b>all</b> claimed territory to the captors at a stroke. Keep fighters near the flag to guard it; push it forward to claim faster at the risk of losing everything.</p>
+        <h2 style="margin-top:16px">Commanding a Battle</h2>
+        <p style="white-space:normal">Before the match, pick a formation preset, drag your six role groups across your half, draw advance routes, and set each group's stance. During the live battle, <b>pause</b> to issue fresh orders — reposition a group, change its stance, or click an enemy to focus-fire — or hit <b>Skip</b> to resolve it instantly.</p>
       </div>
       <div class="panel">
         <h2>Leagues</h2>
@@ -400,119 +405,6 @@ function renderRules() {
     </div>`;
 }
 
-// ---------- match playback ----------
-function startMatchPlayback(result) {
-  const pt = playerTeam(G);
-  const meIdx = result.teams[0].id === pt.id ? 0 : 1;
-  MATCH_PLAYBACK = { result, idx: 0, speed: 700, done: false, meIdx };
-  const [ta, tb] = result.teams;
-  const overlay = document.createElement('div');
-  overlay.className = 'match-overlay';
-  overlay.id = 'match-overlay';
-  overlay.innerHTML = `
-    <div class="match-box">
-      <div class="match-head">
-        <div class="dim small">${esc(result.map.name)} — ${esc(result.map.desc)}</div>
-        <div class="vs"><span class="tA">${esc(ta.name)}</span> <span class="dim">vs</span> <span class="tB">${esc(tb.name)}</span></div>
-      </div>
-      <div class="terrbar"><div class="a" id="tb-a" style="width:10%">10%</div><div class="n"></div><div class="b" id="tb-b" style="width:10%">10%</div></div>
-      <div class="terrmap" id="terrmap">${'<div class="c"></div>'.repeat(200)}</div>
-      <div class="mlog" id="mlog"></div>
-      <div class="match-controls">
-        <button class="btn" data-action="pb-speed" data-id="700">▶ Normal</button>
-        <button class="btn" data-action="pb-speed" data-id="150">▶▶ Fast</button>
-        <button class="btn" data-action="pb-skip">Skip to Result</button>
-      </div>
-      <div id="match-result-slot"></div>
-    </div>`;
-  document.body.appendChild(overlay);
-  schedulePlaybackTick();
-}
-
-function schedulePlaybackTick() {
-  const pb = MATCH_PLAYBACK;
-  if (!pb || pb.done) return;
-  clearTimeout(pb.timer);
-  pb.timer = setTimeout(() => { playbackStep(); schedulePlaybackTick(); }, pb.speed);
-}
-
-function playbackStep() {
-  const pb = MATCH_PLAYBACK;
-  if (!pb) return;
-  if (pb.idx >= pb.result.log.length) { finishPlayback(); return; }
-  revealLogEntry(pb.result.log[pb.idx++]);
-}
-
-function revealLogEntry(e) {
-  const logEl = document.getElementById('mlog');
-  if (!logEl) return;
-  const p = document.createElement('p');
-  p.className = 'e-' + e.type;
-  p.innerHTML = `<span class="tk">[${String(e.t).padStart(2, '0')}']</span> ${esc(e.text)}`;
-  logEl.appendChild(p);
-  logEl.scrollTop = logEl.scrollHeight;
-  updateTerritoryViz(e.terr[0], e.terr[1]);
-}
-
-function updateTerritoryViz(a, b) {
-  const ea = document.getElementById('tb-a'), eb = document.getElementById('tb-b');
-  if (ea) { ea.style.width = a + '%'; ea.textContent = Math.round(a) + '%'; }
-  if (eb) { eb.style.width = b + '%'; eb.textContent = Math.round(b) + '%'; }
-  const map = document.getElementById('terrmap');
-  if (map) {
-    // 40 cols × 5 rows; grid children are placed row-major, so derive each
-    // cell's column-major rank to fill team A from the left edge, B from the right
-    const cells = map.children;
-    const na = Math.round(a * 2), nb = Math.round(b * 2);
-    for (let i = 0; i < 200; i++) {
-      const col = i % 40, row = Math.floor(i / 40);
-      const rankFromLeft = col * 5 + row;
-      const rankFromRight = (39 - col) * 5 + row;
-      cells[i].className = 'c' + (rankFromLeft < na ? ' a' : rankFromRight < nb ? ' b' : '');
-    }
-  }
-}
-
-function finishPlayback() {
-  const pb = MATCH_PLAYBACK;
-  if (!pb || pb.done) return;
-  pb.done = true;
-  clearTimeout(pb.timer);
-  const r = pb.result;
-  const pt = playerTeam(G);
-  const me = pb.meIdx, them = 1 - me;
-  const won = r.winnerId === pt.id;
-  const drew = r.winnerId === null;
-  const headline = drew ? 'A DRAW — honours even.' : won ? `VICTORY by ${r.condition}!` : `DEFEAT — ${esc(r.teams[them].name)} win by ${r.condition}.`;
-  const cas = r.casualties[me].map(c => `${esc(c.player.name)} (out ${c.weeks}w)`).join(', ') || 'none';
-  const dead = r.deaths[me].map(p => esc(p.name)).join(', ');
-  const slot = document.getElementById('match-result-slot');
-  if (slot) slot.innerHTML = `
-    <div class="match-result">
-      <div class="headline">${headline}</div>
-      <p>Final territory: ${r.terr[0]}% – ${r.terr[1]}% · You: ${r.kills[me]} kills, ${r.incaps[me]} incapacitations${r.ctCaptured[them] ? ' · enemy flag CAPTURED' : ''}${r.ctCaptured[me] ? ' · <span class="danger">your flag was captured</span>' : ''}</p>
-      <p class="small">Your casualties: ${cas}${dead ? ` · <span class="danger">KILLED: ${dead}</span>` : ''}</p>
-      <button class="btn primary" style="margin-top:10px" data-action="pb-close">Continue</button>
-    </div>`;
-}
-
-function skipPlayback() {
-  const pb = MATCH_PLAYBACK;
-  if (!pb) return;
-  while (pb.idx < pb.result.log.length) revealLogEntry(pb.result.log[pb.idx++]);
-  finishPlayback();
-}
-
-function closePlayback() {
-  const pb = MATCH_PLAYBACK;
-  if (pb) clearTimeout(pb.timer);
-  MATCH_PLAYBACK = null;
-  const el = document.getElementById('match-overlay');
-  if (el) el.remove();
-  saveGame();
-  render();
-}
-
 // ---------- event wiring ----------
 document.addEventListener('click', ev => {
   const el = ev.target.closest('[data-action]');
@@ -521,10 +413,9 @@ document.addEventListener('click', ev => {
   switch (el.dataset.action) {
     case 'nav': SCREEN = id; render(); break;
     case 'continue': {
-      const res = playMatchday(G);
-      saveGame();
-      if (res) startMatchPlayback(res);
-      else render();
+      const mctx = beginMatchday(G);
+      if (mctx) openBattle(mctx);       // planning → real-time battle → commit
+      else { playMatchday(G); saveGame(); render(); }
       break;
     }
     case 'next-season': startNextSeason(G); saveGame(); SCREEN = 'home'; render(); break;
@@ -556,9 +447,6 @@ document.addEventListener('click', ev => {
         G = null; render();
       }
       break;
-    case 'pb-speed': { if (MATCH_PLAYBACK) { MATCH_PLAYBACK.speed = parseInt(id, 10); schedulePlaybackTick(); } break; }
-    case 'pb-skip': skipPlayback(); break;
-    case 'pb-close': closePlayback(); break;
   }
 });
 

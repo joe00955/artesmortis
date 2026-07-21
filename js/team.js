@@ -21,6 +21,7 @@ function genTeam(name, quality, isPlayer) {
     isPlayer: !!isPlayer,
     roster,
     tactics: DEFAULT_TACTICS(),
+    preset: 'balanced',
     armory: isPlayer ? [] : aiDefaultArmory(quality),
     probeLicense: false,
     balance: 0,

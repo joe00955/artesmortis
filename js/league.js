@@ -91,6 +91,45 @@ function playMatchday(state) {
   return playerResult;
 }
 
+// --- Interactive player-match flow (used by the UI) ---
+// Returns the player's fixture context WITHOUT simulating it, so the UI can run
+// the planning screen and the real-time battle. AI matches are held until the
+// player result is committed.
+function beginMatchday(state) {
+  const round = currentFixtures(state);
+  if (!round) return null;
+  const pt = playerTeam(state);
+  const fx = round.find(f => (f.home === pt.id || f.away === pt.id) && !f.result);
+  if (!fx) return null;
+  return {
+    fx,
+    home: teamById(state, fx.home),
+    away: teamById(state, fx.away),
+    map: fx.map,
+    playerSide: fx.home === pt.id ? 0 : 1,
+  };
+}
+
+// Commit an interactive battle result (rosters already mutated by the engine),
+// then resolve the rest of the round headlessly and advance the week.
+function commitPlayerResult(state, fx, res) {
+  const home = teamById(state, fx.home), away = teamById(state, fx.away);
+  fx.result = summarizeResult(res);
+  applyResult(state, home, away, res);
+  state.history.push(fx.result);
+
+  const round = currentFixtures(state);
+  const lt = leagueType(state);
+  for (const other of round) {
+    if (other.result) continue;
+    const h = teamById(state, other.home), a = teamById(state, other.away);
+    const r = simulateMatch(h, a, lt, other.map);
+    other.result = summarizeResult(r);
+    applyResult(state, h, a, r);
+  }
+  advanceWeek(state);
+}
+
 function summarizeResult(res) {
   return {
     homeId: res.teams[0].id, awayId: res.teams[1].id,
