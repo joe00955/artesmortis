@@ -152,7 +152,7 @@ ul.banned li::before { content: "✕ "; }
 .terrbar2 .a { background: #3d6fb0; transition: width .2s; }
 .terrbar2 .b { background: #b0453a; margin-left: auto; transition: width .2s; }
 .live-status { font-size: 12px; color: var(--text); font-variant-numeric: tabular-nums; }
-.live-controls { display: flex; gap: 6px; align-items: center; margin-bottom: 10px; }
+.live-controls { display: flex; gap: 6px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
 .order-panel { border-top: 1px solid var(--line); padding-top: 8px; min-height: 40px; }
 .live-log {
   background: #0b0e13; border: 1px solid var(--line); height: 260px; overflow-y: auto;

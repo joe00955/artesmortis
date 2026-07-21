@@ -7,7 +7,7 @@ const vm = require('vm');
 
 const ctx = { console, Math, JSON };
 vm.createContext(ctx);
-for (const f of ['data.js', 'player.js', 'team.js', 'field.js', 'formation.js', 'battle.js', 'league.js']) {
+for (const f of ['data.js', 'player.js', 'team.js', 'field.js', 'pathfind.js', 'formation.js', 'battle.js', 'league.js']) {
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'js', f), 'utf8'), ctx, { filename: f });
 }
 

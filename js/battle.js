@@ -103,6 +103,8 @@ function mkUnit(player, role, side, team, pos, group, weapons, gearProtect) {
     id: player.id, player, role, side, team,
     x: pos.x, y: pos.y, hx: pos.x, hy: pos.y,   // home anchor
     hp: 100, state: 'active', wpIndex: 0, forceId: null,
+    face: side === 0 ? 0 : Math.PI, suppress: 0,
+    _path: null, _pathGoal: null, _pathIdx: 0,
     stance: group.stance, route: group.route.slice(), anchor: { x: pos.x, y: pos.y },
     speed: prof.speed * (0.7 + st.speed / 28),
     sight: prof.sight * (1 + (st.tacticalIQ - 10) / 40),
@@ -175,6 +177,8 @@ function stepBattle(b, dt) {
   for (let i = 0; i < 2; i++) claimTerritory(b, b.sides[i]);
   for (let i = 0; i < 2; i++) tryCapture(b, b.sides[i], b.sides[1 - i], dt);
   for (let i = 0; i < 2; i++) updateMorale(b, b.sides[i], b.sides[1 - i], dt);
+
+  if (b.time >= (b._nextAdapt || 0)) { b._nextAdapt = b.time + 4; aiAdapt(b); }
 
   checkWin(b);
   if (!b.over && b.time >= TIME_LIMIT) endByTime(b);
@@ -315,11 +319,26 @@ function nearbyCover(f, u) {
 }
 function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
 
+// Steer straight to the goal when it's visible; plan a path around hard cover
+// only when the direct line is blocked.
+function pathSteer(b, u, goal) {
+  if (losClear(b.field, u.x, u.y, goal.x, goal.y)) { u._path = null; return goal; }
+  const needRe = !u._path || !u._pathGoal || Math.hypot(u._pathGoal.x - goal.x, u._pathGoal.y - goal.y) > 45;
+  if (needRe) { u._path = aStar(b.field, u.x, u.y, goal.x, goal.y); u._pathGoal = { x: goal.x, y: goal.y }; u._pathIdx = 0; }
+  if (!u._path || !u._path.length) return goal;
+  let node = u._path[u._pathIdx];
+  while (node && Math.hypot(node.x - u.x, node.y - u.y) < 22) { u._pathIdx++; node = u._path[u._pathIdx]; }
+  return node || goal;
+}
+
 function moveUnit(b, u, goal, dt) {
-  let dx = goal.x - u.x, dy = goal.y - u.y;
+  u.suppress = Math.max(0, u.suppress - dt * 0.6);
+  const steer = pathSteer(b, u, goal);
+  let dx = steer.x - u.x, dy = steer.y - u.y;
   const d = Math.hypot(dx, dy);
   if (d < 2) return;
   dx /= d; dy /= d;
+  u.face = Math.atan2(dy, dx);
   // separation from nearby allies
   let sx = 0, sy = 0;
   for (const a of b.sides[u.side].units) {
@@ -330,7 +349,7 @@ function moveUnit(b, u, goal, dt) {
   dx += sx * 0.5; dy += sy * 0.5;
   const m = Math.hypot(dx, dy) || 1; dx /= m; dy /= m;
 
-  let sp = u.speed * terrainSpeed(b, u.x, u.y);
+  let sp = u.speed * terrainSpeed(b, u.x, u.y) * (1 - 0.4 * u.suppress);
   if (u.stance === 'flank' || u.role === 'RR') sp *= 1.1;
   let step = sp * dt;
   let nx = u.x + dx * step, ny = u.y + dy * step;
@@ -366,21 +385,46 @@ function tryShoot(b, u, side, foe, dt) {
   const d = dist(u, target);
   if (d > u.range) return;
   u.cool = u.cd * (0.85 + rnd() * 0.3);
+  u.face = Math.atan2(target.y - u.y, target.x - u.x);
 
   const aimN = u.aim / 20;
   let pHit = 0.14 + aimN * 0.30;
   pHit *= clamp(1.12 - (d / u.range) * 0.9, 0.15, 1.05);
-  pHit *= 1 - coverAt(b.field, target.x, target.y);
+  pHit *= 1 - coverAgainst(b.field, target.x, target.y, u.x, u.y);  // directional cover
+  pHit *= 1 - 0.4 * u.suppress;                                     // suppressed shooters miss more
   if (target._moving) pHit *= 0.82;
   if (onHighGround(b.field, u.x, u.y)) pHit *= u.role === 'HK' ? 1.25 : 1.1;
   pHit *= side.coordination;
   b.events.push({ kind: 'shot', x1: u.x, y1: u.y, x2: target.x, y2: target.y, side: u.side, hawk: u.role === 'HK' });
 
+  // incoming fire suppresses the target whether or not it lands
+  target.suppress = Math.min(1, target.suppress + 0.18);
+
   if (rnd() < pHit) {
     const dmg = (u.dmg + rint(-3, 3)) * (1 - Math.min(0.4, target.protect * 0.06));
     applyDamage(b, target, foe, u, dmg);
-    b.events.push({ kind: 'hit', x: target.x, y: target.y, side: u.side });
+    b.events.push({ kind: 'hit', x: target.x, y: target.y, side: u.side, dmg: Math.round(dmg) });
+    target.suppress = Math.min(1, target.suppress + 0.25);
   }
+}
+
+// Cover reduces the hit chance only against fire coming from the side the cover
+// faces. Being inside the cover gives near-full protection from all angles.
+function coverAgainst(field, tx, ty, sx, sy) {
+  let best = 0;
+  const svx = sx - tx, svy = sy - ty, sm = Math.hypot(svx, svy) || 1;
+  for (const c of field.covers) {
+    const cvx = c.x - tx, cvy = c.y - ty, cm = Math.hypot(cvx, cvy);
+    if (cm > c.r + 6) continue;
+    if (cm < 10) { best = Math.max(best, 0.5); continue; }
+    const align = (svx * cvx + svy * cvy) / (sm * cm);   // 1 = cover between us and shooter
+    if (align > 0) best = Math.max(best, 0.5 * (1 - cm / (c.r + 6)) * align);
+  }
+  for (const h of field.highs) {                          // high ground = slight all-round cover
+    const d = Math.hypot(h.x - tx, h.y - ty);
+    if (d < h.r) best = Math.max(best, 0.18 * (1 - d / h.r));
+  }
+  return best;
 }
 
 function applyDamage(b, target, targetSide, shooter, dmg) {
@@ -403,6 +447,7 @@ function downUnit(b, target, targetSide, shooter) {
       else { shooterSide.incaps++; shooter.player.seasonStats.incaps++; }
     }
   }
+  b.events.push({ kind: fatal ? 'kill' : 'down', x: target.x, y: target.y, side: target.side, name: target.player.name, role: target.role, by: shooter ? shooter.player.name : null });
   if (fatal) b._emit('death', `${target.player.name} (${ROLES[target.role].name}, ${target.team.name}) is KILLED${shooter ? ' by ' + shooter.player.name : ''}. The oversight drones descend.`);
   else b._emit('incap', `${target.player.name} (${ROLES[target.role].name}, ${target.team.name}) is incapacitated${shooter ? ' by ' + shooter.player.name : ''} and dragged off.`);
 }
@@ -502,7 +547,38 @@ function tryCapture(b, side, foe, dt) {
   let moved = 0;
   for (let i = 0; i < b.territory.length; i++) if (b.territory[i] === foe.side) { b.territory[i] = side.side; moved++; }
   foe.morale -= 40; side.morale = clamp(side.morale + 15, 0, 120);
+  b.events.push({ kind: 'capture', x: ct.x, y: ct.y, side: side.side, by: attacker.player.name, foe: foe.team.name });
   b._emit('capture', `FLAG CAPTURED! ${attacker.player.name} seizes the ${foe.team.name} colours — ${Math.round(moved / TERR_CELLS * 100)}% of the field transfers to ${side.team.name} at a stroke.`);
+}
+
+// ---------- adaptive AI ----------
+// AI managers reassess every few seconds: defend a threatened flag, press an
+// advantage, or dig in when they're losing. Only ever mutates AI-side units.
+function aiAdapt(b) {
+  for (const s of b.sides) {
+    if (s.team.isPlayer) continue;
+    const foe = b.sides[1 - s.side];
+    const terr = terrPercent(b.territory);
+    const myF = fightersActive(s), foeF = fightersActive(foe);
+
+    // pull the two nearest Countrymen back to a threatened flag
+    const ct = s.units.find(u => u.role === 'CT' && u.state === 'active');
+    if (ct) {
+      const threatened = foe.units.some(u => u.state === 'active' && u.fighter && Math.hypot(u.x - ct.x, u.y - ct.y) < 165);
+      if (threatened) {
+        s.units.filter(u => u.state === 'active' && u.role === 'CM')
+          .sort((a, z) => Math.hypot(a.x - ct.x, a.y - ct.y) - Math.hypot(z.x - ct.x, z.y - ct.y))
+          .slice(0, 2)
+          .forEach(gd => { gd.route = [{ x: ct.x, y: ct.y }]; gd._pathGoal = null; gd.forceId = null; gd.stance = 'push'; });
+      }
+    }
+    // adjust tempo to the state of the battle
+    if (myF < foeF - 2 && terr[s.side] <= terr[foe.side]) {
+      for (const u of s.units) if (u.role === 'CM' && u.stance === 'push') u.stance = 'hold';
+    } else if (myF > foeF + 2 || terr[s.side] > terr[foe.side] + 25) {
+      for (const u of s.units) if (u.role === 'CM' && u.stance === 'hold') u.stance = 'push';
+    }
+  }
 }
 
 // ---------- morale / surrender ----------

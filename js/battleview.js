@@ -256,6 +256,10 @@ function startLive() {
   BV.speed = 1;
   BV.orderGroup = null;
   BV.last = performance.now();
+  BV.lastDraw = BV.last;
+  BV.fx = []; BV.floats = []; BV.feed = []; BV.shake = 0;
+
+  AudioSFX.init(); AudioSFX.resume(); AudioSFX.klaxon();  // audio unlocks on this user gesture
 
   const ov = document.getElementById('battle-overlay');
   ov.innerHTML = `
@@ -279,6 +283,7 @@ function startLive() {
           <button class="btn mini ${BV.speed === 2 ? 'sel' : ''}" data-bv="speed" data-id="2">2×</button>
           <button class="btn mini ${BV.speed === 4 ? 'sel' : ''}" data-bv="speed" data-id="4">4×</button>
           <button class="btn mini" data-bv="skip" id="btn-skip">Skip ▸▸</button>
+          <button class="btn mini" data-bv="mute" id="btn-mute">${AudioSFX.muted ? '🔇' : '🔊'}</button>
         </div>
         <div id="order-panel" class="order-panel"></div>
         <h3 style="margin-top:12px">Battle Log</h3>
@@ -309,9 +314,11 @@ function loop() {
     let dt = Math.min((now - BV.last) / 1000, 0.05);
     BV.last = now;
     if (!BV.paused && !b.over) {
+      const t0 = b.time;
       let t = dt * BV.speed;
       let guard = 0;
       while (t > 0 && guard++ < 64) { b.step(Math.min(t, DT_MAX)); t -= DT_MAX; if (b.over) break; }
+      if (b.time > t0) ingestEvents(b);   // turn this step's events into effects/sound
     }
     drawLive();
     updateLiveHUD();
@@ -347,52 +354,199 @@ function installVisibilityHandler() {
   });
 }
 
+function makeOff(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
+
 function drawLive() {
   const b = BV.battle;
   const canvas = document.getElementById('live-canvas');
   if (!canvas) return;
   const ctx = canvas.getContext('2d');
-  drawField(ctx, true, b.territory);
+  const now = performance.now();
+  const fdt = Math.min((now - (BV.lastDraw || now)) / 1000, 0.05);
+  BV.lastDraw = now;
+  ageEffects(fdt);
 
-  // claim radii around controllers
+  ctx.save();
+  if (BV.shake > 0.4) ctx.translate((Math.random() - 0.5) * BV.shake, (Math.random() - 0.5) * BV.shake);
+
+  drawField(ctx, false, null);       // terrain + bases (blocky territory handled by the heatmap)
+  drawHeatmap(ctx, b);               // smooth territory influence
+  drawClaimRadii(ctx, b);
+  drawDrones(ctx, b);
+  drawEffects(ctx, 'under');         // tracers + muzzle flashes beneath the units
+  for (const s of b.sides) for (const u of s.units) drawUnit(ctx, u, s.side === BV.playerSide);
+  drawEffects(ctx, 'over');          // sparks + bursts on top
+  drawFloating(ctx);
+  drawFog(ctx, b);                   // dim ground the player has no eyes on
+  if (BV.paused && BV.orderGroup) {
+    for (const u of b.sides[BV.playerSide].units) {
+      if (u.role === BV.orderGroup && u.state === 'active') ringCircle(ctx, camX(u.x), u.y, 13, '#e6c675');
+    }
+  }
+  ctx.restore();
+
+  drawVignette(ctx);
+  drawKillFeed(ctx);
+}
+
+function drawHeatmap(ctx, b) {
+  const oc = BV.heat || (BV.heat = makeOff(TERR_COLS, TERR_ROWS));
+  const octx = oc.getContext('2d');
+  const img = octx.createImageData(TERR_COLS, TERR_ROWS);
+  for (let i = 0; i < TERR_CELLS; i++) {
+    const o = b.territory[i], p = i * 4;
+    if (o === BV.playerSide) { img.data[p] = 79; img.data[p + 1] = 157; img.data[p + 2] = 255; img.data[p + 3] = 96; }
+    else if (o === 1 - BV.playerSide) { img.data[p] = 224; img.data[p + 1] = 87; img.data[p + 2] = 74; img.data[p + 3] = 96; }
+  }
+  octx.putImageData(img, 0, 0);
+  ctx.save();
+  ctx.imageSmoothingEnabled = true;
+  if (BV.playerSide === 1) { ctx.translate(FIELD_W, 0); ctx.scale(-1, 1); }
+  ctx.drawImage(oc, 0, 0, TERR_COLS, TERR_ROWS, 0, 0, FIELD_W, FIELD_H);
+  ctx.restore();
+}
+
+function drawClaimRadii(ctx, b) {
   for (const s of b.sides) {
     const ct = s.units.find(u => u.role === 'CT' && u.state === 'active');
     if (!ct) continue;
-    const col = s.side === BV.playerSide ? 'rgba(79,157,255,0.10)' : 'rgba(224,87,74,0.10)';
-    fillCircle(ctx, camX(ct.x), ct.y, CLAIM_RADIUS, col);
-  }
-  // drones + their vision
-  for (const s of b.sides) {
-    for (const dr of s.drones) {
-      const col = s.side === BV.playerSide ? TEAM_COL.me : TEAM_COL.foe;
-      ctx.strokeStyle = 'rgba(255,255,255,0.05)';
-      ringCircle(ctx, camX(dr.x), dr.y, dr.range, 'rgba(255,255,255,0.04)');
-      drawDrone(ctx, camX(dr.x), dr.y, col, dr.kind === 'strike');
-    }
-  }
-  // shot / hit events
-  for (const e of b.events) {
-    if (e.kind === 'shot') {
-      ctx.strokeStyle = e.drone ? 'rgba(124,207,214,0.7)' : e.hawk ? 'rgba(159,208,255,0.85)' : (e.side === BV.playerSide ? 'rgba(120,180,255,0.55)' : 'rgba(255,140,120,0.55)');
-      ctx.lineWidth = e.hawk ? 1.6 : 1;
-      if (e.drone) ctx.setLineDash([4, 3]);
-      ctx.beginPath(); ctx.moveTo(camX(e.x1), e.y1); ctx.lineTo(camX(e.x2), e.y2); ctx.stroke();
-      ctx.setLineDash([]);
-    } else if (e.kind === 'hit') {
-      fillCircle(ctx, camX(e.x), e.y, 5, 'rgba(255,220,120,0.9)');
-    }
-  }
-  // units
-  for (const s of b.sides) {
     const mine = s.side === BV.playerSide;
-    for (const u of s.units) drawUnit(ctx, u, mine);
+    const g = ctx.createRadialGradient(camX(ct.x), ct.y, CLAIM_RADIUS * 0.4, camX(ct.x), ct.y, CLAIM_RADIUS);
+    g.addColorStop(0, mine ? 'rgba(79,157,255,0.14)' : 'rgba(224,87,74,0.14)');
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(camX(ct.x), ct.y, CLAIM_RADIUS, 0, 7); ctx.fill();
+    ringCircle(ctx, camX(ct.x), ct.y, CLAIM_RADIUS, mine ? 'rgba(79,157,255,0.25)' : 'rgba(224,87,74,0.25)');
   }
-  // order targeting highlight
-  if (BV.paused && BV.orderGroup) {
-    for (const u of b.sides[BV.playerSide].units) {
-      if (u.role === BV.orderGroup && u.state === 'active') ringCircle(ctx, camX(u.x), u.y, 12, '#e6c675');
+}
+
+function drawDrones(ctx, b) {
+  for (const s of b.sides) for (const dr of s.drones) {
+    ringCircle(ctx, camX(dr.x), dr.y, dr.range, 'rgba(255,255,255,0.045)');
+    drawDrone(ctx, camX(dr.x), dr.y, s.side === BV.playerSide ? TEAM_COL.me : TEAM_COL.foe, dr.kind === 'strike');
+  }
+}
+
+// ---------- transient effects ----------
+function ageEffects(dt) {
+  BV.shake = Math.max(0, (BV.shake || 0) - dt * 34);
+  const age = arr => { for (let i = arr.length - 1; i >= 0; i--) { arr[i].age += dt; if (arr[i].age >= arr[i].life) arr.splice(i, 1); } };
+  age(BV.fx); age(BV.floats);
+  for (let i = BV.feed.length - 1; i >= 0; i--) { BV.feed[i].age += dt; if (BV.feed[i].age >= BV.feed[i].life) BV.feed.splice(i, 1); }
+}
+
+function ingestEvents(b) {
+  for (const e of b.events) {
+    const mine = e.side === BV.playerSide;
+    if (e.kind === 'shot') {
+      BV.fx.push({ t: 'tracer', x1: camX(e.x1), y1: e.y1, x2: camX(e.x2), y2: e.y2, hawk: e.hawk, drone: e.drone, mine, age: 0, life: 0.13 });
+      BV.fx.push({ t: 'flash', x: camX(e.x1), y: e.y1, age: 0, life: 0.08, hawk: e.hawk });
+      if (e.drone) { /* silent */ } else if (e.hawk) AudioSFX.hawk(); else AudioSFX.gun();
+    } else if (e.kind === 'hit') {
+      BV.fx.push({ t: 'spark', x: camX(e.x), y: e.y, age: 0, life: 0.3 });
+      if (e.dmg) BV.floats.push({ x: camX(e.x), y: e.y, text: '-' + e.dmg, color: '#ffd36b', age: 0, life: 0.8, vy: 26 });
+      AudioSFX.hit();
+    } else if (e.kind === 'down' || e.kind === 'kill') {
+      const kill = e.kind === 'kill';
+      BV.fx.push({ t: 'burst', x: camX(e.x), y: e.y, age: 0, life: 0.55, color: kill ? '#e0574a' : '#8fa3bd', r: kill ? 24 : 15 });
+      BV.floats.push({ x: camX(e.x), y: e.y - 6, text: (kill ? '✖ ' : '') + e.name.split(' ').pop(), color: kill ? '#ff8a7a' : '#aab6c8', age: 0, life: 1.4, vy: 15 });
+      BV.feed.unshift({ name: e.name, role: e.role, by: e.by, kill, mine, age: 0, life: 5.5 });
+      if (BV.feed.length > 6) BV.feed.pop();
+      BV.shake = Math.min(16, BV.shake + (kill ? 5 : 2));
+      if (kill) AudioSFX.kill(); else AudioSFX.hit();
+    } else if (e.kind === 'capture') {
+      BV.fx.push({ t: 'burst', x: camX(e.x), y: e.y, age: 0, life: 0.85, color: '#ff7ab8', r: 44 });
+      BV.floats.push({ x: camX(e.x), y: e.y - 10, text: 'FLAG TAKEN', color: '#ff7ab8', age: 0, life: 1.9, vy: 12 });
+      BV.feed.unshift({ capture: true, by: e.by, foe: e.foe, mine, age: 0, life: 6.5 });
+      BV.shake = Math.min(22, BV.shake + 12);
+      AudioSFX.capture();
     }
   }
+}
+
+function drawEffects(ctx, layer) {
+  for (const f of BV.fx) {
+    const k = 1 - f.age / f.life;
+    if (layer === 'under') {
+      if (f.t === 'tracer') {
+        ctx.strokeStyle = f.drone ? `rgba(124,207,214,${0.7 * k})` : f.hawk ? `rgba(180,215,255,${k})` : (f.mine ? `rgba(150,200,255,${0.85 * k})` : `rgba(255,150,120,${0.85 * k})`);
+        ctx.lineWidth = f.hawk ? 2 : 1.3;
+        if (f.drone) ctx.setLineDash([4, 3]);
+        ctx.beginPath(); ctx.moveTo(f.x1, f.y1); ctx.lineTo(f.x2, f.y2); ctx.stroke();
+        ctx.setLineDash([]);
+      } else if (f.t === 'flash') {
+        fillCircle(ctx, f.x, f.y, (f.hawk ? 5 : 3.5) * (0.6 + k), `rgba(255,230,150,${k})`);
+      }
+    } else {
+      if (f.t === 'spark') {
+        fillCircle(ctx, f.x, f.y, 3 + (1 - k) * 4, `rgba(255,220,120,${k})`);
+      } else if (f.t === 'burst') {
+        ctx.strokeStyle = f.color.replace(')', `,${k})`).replace('rgb', 'rgba').replace('#', '');
+        ctx.strokeStyle = hexA(f.color, k); ctx.lineWidth = 2.5;
+        ctx.beginPath(); ctx.arc(f.x, f.y, f.r * (1 - k) + 4, 0, 7); ctx.stroke();
+        fillCircle(ctx, f.x, f.y, f.r * 0.35 * k + 2, hexA(f.color, k * 0.5));
+      }
+    }
+  }
+}
+function hexA(hex, a) {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${Math.max(0, a)})`;
+}
+
+function drawFloating(ctx) {
+  ctx.textAlign = 'center'; ctx.font = 'bold 12px sans-serif';
+  for (const f of BV.floats) {
+    const k = 1 - f.age / f.life;
+    ctx.fillStyle = hexA(f.color, k);
+    ctx.fillText(f.text, f.x, f.y - f.vy * f.age);
+  }
+  ctx.textAlign = 'left';
+}
+
+function drawFog(ctx, b) {
+  const scale = 0.5, fw = Math.round(FIELD_W * scale), fh = Math.round(FIELD_H * scale);
+  const oc = BV.fog || (BV.fog = makeOff(fw, fh));
+  const octx = oc.getContext('2d');
+  octx.clearRect(0, 0, fw, fh);
+  octx.fillStyle = 'rgba(6,9,14,0.6)'; octx.fillRect(0, 0, fw, fh);
+  octx.globalCompositeOperation = 'destination-out';
+  const me = b.sides[BV.playerSide];
+  const punch = (x, y, r) => {
+    const sx = camX(x) * scale, sy = y * scale, sr = r * scale;
+    const g = octx.createRadialGradient(sx, sy, 0, sx, sy, sr);
+    g.addColorStop(0, 'rgba(0,0,0,1)'); g.addColorStop(0.72, 'rgba(0,0,0,1)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+    octx.fillStyle = g; octx.beginPath(); octx.arc(sx, sy, sr, 0, 7); octx.fill();
+  };
+  punch(me.base.x, me.base.y, 150);
+  for (const u of me.units) { if (u.state === 'active' && u.sight) punch(u.x, u.y, u.sight * 0.92); }
+  for (const dr of me.drones) punch(dr.x, dr.y, dr.range);
+  octx.globalCompositeOperation = 'source-over';
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(oc, 0, 0, fw, fh, 0, 0, FIELD_W, FIELD_H);
+}
+
+function drawVignette(ctx) {
+  const g = ctx.createRadialGradient(FIELD_W / 2, FIELD_H / 2, FIELD_H * 0.35, FIELD_W / 2, FIELD_H / 2, FIELD_H * 0.85);
+  g.addColorStop(0, 'rgba(0,0,0,0)'); g.addColorStop(1, 'rgba(0,0,0,0.45)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, FIELD_W, FIELD_H);
+}
+
+function drawKillFeed(ctx) {
+  ctx.textAlign = 'right'; ctx.font = '12px "SFMono-Regular", Consolas, monospace';
+  let y = 20;
+  for (const f of BV.feed) {
+    const k = Math.min(1, (f.life - f.age) / 0.6);
+    if (f.capture) {
+      ctx.fillStyle = hexA('#ff7ab8', k);
+      ctx.fillText(`⚑ ${f.by} took the ${f.foe} flag`, FIELD_W - 10, y);
+    } else {
+      ctx.fillStyle = hexA(f.kill ? '#ff8a7a' : '#c7d0de', k * (f.kill ? 1 : 0.8));
+      const verb = f.kill ? '✖ killed' : '· downed';
+      ctx.fillText(`${f.by || '—'} ${verb} ${f.name} (${f.role})`, FIELD_W - 10, y);
+    }
+    y += 17;
+  }
+  ctx.textAlign = 'left';
 }
 
 function drawUnit(ctx, u, mine) {
@@ -402,8 +556,22 @@ function drawUnit(ctx, u, mine) {
   if (u.state === 'down') { drawX(ctx, x, y, mine ? 'rgba(79,157,255,0.4)' : 'rgba(224,87,74,0.4)'); return; }
   if (u.state === 'captured') return;
   const shape = ROLE_GLYPH[u.role];
-  ctx.fillStyle = col; ctx.strokeStyle = '#0c0f14'; ctx.lineWidth = 1;
   const r = u.role === 'CT' ? 8 : u.role === 'RR' ? 7 : 6;
+
+  // soft drop shadow
+  fillCircle(ctx, x + 1.5, y + 2, r + 1, 'rgba(0,0,0,0.35)');
+
+  // facing barrel for fighters (camera flips x, so mirror the angle for side 1)
+  if (u.fighter) {
+    const fa = BV.playerSide === 1 ? Math.PI - u.face : u.face;
+    ctx.strokeStyle = mine ? 'rgba(190,215,255,0.9)' : 'rgba(255,190,175,0.9)';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(fa) * (r + 6), y + Math.sin(fa) * (r + 6)); ctx.stroke();
+  }
+  // suppression shudder ring
+  if (u.suppress > 0.25) ringCircle(ctx, x, y, r + 4, `rgba(230,200,120,${0.5 * u.suppress})`);
+
+  ctx.fillStyle = col; ctx.strokeStyle = '#0c0f14'; ctx.lineWidth = 1;
   ctx.beginPath();
   if (shape === 'circle') ctx.arc(x, y, r, 0, 7);
   else if (shape === 'square') { ctx.rect(x - r, y - r, r * 2, r * 2); }
@@ -537,6 +705,7 @@ function finishLive() {
   const me = BV.playerSide, them = 1 - me;
   const pt = playerTeam(G);
   const won = r.winnerId === pt.id, drew = r.winnerId === null;
+  if (drew) AudioSFX.ui(); else if (won) AudioSFX.win(); else AudioSFX.lose();
   const headline = drew ? 'A DRAW — honours even.' : won ? `VICTORY by ${r.condition}!` : `DEFEAT — ${esc(r.teams[them].name)} win by ${r.condition}.`;
   const cas = r.casualties[me].map(c => `${esc(c.player.name)} (out ${c.weeks}w)`).join(', ') || 'none';
   const dead = r.deaths[me].map(p => esc(p.name)).join(', ');
@@ -587,6 +756,12 @@ document.addEventListener('click', ev => {
       document.querySelectorAll('[data-bv="speed"]').forEach(b2 => b2.classList.toggle('sel', b2.dataset.id === id));
       break;
     case 'skip': skipLive(); break;
+    case 'mute': {
+      AudioSFX.init(); AudioSFX.setMuted(!AudioSFX.muted);
+      el.textContent = AudioSFX.muted ? '🔇' : '🔊';
+      if (!AudioSFX.muted) { AudioSFX.resume(); AudioSFX.ui(); }
+      break;
+    }
     case 'ordergroup': BV.orderGroup = id; renderOrderPanel(); drawLive(); break;
     case 'orderstance': if (BV.orderGroup) { issueStance(BV.orderGroup, id); flashOrderHint(`${ROLES[BV.orderGroup].name}s → ${STANCES[id].label}`); } break;
     case 'commit': commitAndClose(); break;
