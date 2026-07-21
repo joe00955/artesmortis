@@ -34,7 +34,9 @@ function openBattle(mctx) {
 
 function closeBattle() {
   BV.open = false;
+  stopWatchdog();
   if (BV._raf) cancelAnimationFrame(BV._raf);
+  BV._raf = null;
   const ov = document.getElementById('battle-overlay');
   if (ov) ov.remove();
 }
@@ -286,23 +288,63 @@ function startLive() {
   wireLiveCanvas();
   renderOrderPanel();
   BV.logShown = 0;
+  BV.beat = performance.now();
+  startWatchdog();
+  installVisibilityHandler();
   loop();
 }
 
+// The render loop is built to be un-killable: it reschedules itself even if a
+// single frame throws, and a watchdog restarts it if it ever stops beating
+// (e.g. the browser paused requestAnimationFrame while the tab was backgrounded,
+// or an unexpected error killed a frame). This prevents the "everything just
+// stops" freeze — the simulation always keeps advancing.
 function loop() {
+  BV._raf = null;
   if (!BV.open || BV.phase !== 'live') return;
-  const b = BV.battle;
-  const now = performance.now();
-  let dt = Math.min((now - BV.last) / 1000, 0.05);
-  BV.last = now;
-  if (!BV.paused && !b.over) {
-    let t = dt * BV.speed;
-    while (t > 0) { b.step(Math.min(t, DT_MAX)); t -= DT_MAX; if (b.over) break; }
+  BV.beat = performance.now();
+  try {
+    const b = BV.battle;
+    const now = performance.now();
+    let dt = Math.min((now - BV.last) / 1000, 0.05);
+    BV.last = now;
+    if (!BV.paused && !b.over) {
+      let t = dt * BV.speed;
+      let guard = 0;
+      while (t > 0 && guard++ < 64) { b.step(Math.min(t, DT_MAX)); t -= DT_MAX; if (b.over) break; }
+    }
+    drawLive();
+    updateLiveHUD();
+    if (b.over) { finishLive(); return; }
+  } catch (err) {
+    console.error('Artes Mortis: battle frame error (recovering, sim continues):', err);
   }
-  drawLive();
-  updateLiveHUD();
-  if (b.over) { finishLive(); return; }
   BV._raf = requestAnimationFrame(loop);
+}
+
+function startWatchdog() {
+  stopWatchdog();
+  BV.watchdog = setInterval(() => {
+    if (!BV.open || BV.phase !== 'live' || BV.paused) return;
+    if (performance.now() - (BV.beat || 0) > 1200) {
+      // the loop stopped beating — kick it back to life
+      BV.last = performance.now();
+      if (BV._raf) cancelAnimationFrame(BV._raf);
+      BV._raf = requestAnimationFrame(loop);
+    }
+  }, 1000);
+}
+function stopWatchdog() { if (BV.watchdog) { clearInterval(BV.watchdog); BV.watchdog = null; } }
+
+function installVisibilityHandler() {
+  if (BV._visInstalled) return;
+  BV._visInstalled = true;
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && BV.open && BV.phase === 'live') {
+      BV.last = performance.now();               // avoid a huge catch-up step
+      if (!BV._raf) BV._raf = requestAnimationFrame(loop);
+    }
+  });
 }
 
 function drawLive() {
@@ -487,8 +529,9 @@ function skipLive() {
 
 function finishLive() {
   const b = BV.battle;
-  if (!b.result) return;
+  if (!b.result || BV.phase === 'done') return;
   BV.phase = 'done';
+  stopWatchdog();
   drawLive(); updateLiveHUD();
   const r = b.result;
   const me = BV.playerSide, them = 1 - me;
